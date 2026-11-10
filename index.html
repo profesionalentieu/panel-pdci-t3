@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel PdCI T3</title>
+<!--
+  Tarea N.º 3 - Host Application Sparkplug B (página web).
+  Se conecta al broker por MQTT sobre WebSocket seguro (WSS), se suscribe a spBv1.0/{group}/#,
+  decodifica los payloads Protobuf con la definición oficial sparkplug_b.proto y muestra el estado
+  de cada capa. Comanda las salidas con DCMD y pide Rebirth con NCMD.
+  Bibliotecas: mqtt.js (cliente MQTT) y protobuf.js (codificación Protobuf).
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Barlow+Condensed:wght@600;700&display=swap">
+<script src="https://unpkg.com/mqtt@5.14.1/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/protobufjs@7.4.0/dist/protobuf.min.js"></script>
+<style>
+/* Panel de sala de control: cadena de capas arriba, tarjetas de datos debajo. */
+:root {
+  --bg: #F3F5F7; --panel: #FFFFFF; --line: #D9E0E6; --fg: #17212B; --mute: #5E6B78;
+  --ok: #1F9D6B; --bad: #D64541; --warn: #D98A1C; --off: #A3AEB9; --accent: #2F6FDB;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --sans: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+  --disp: "Barlow Condensed", "Arial Narrow", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0D141B; --panel: #15202B; --line: #26333F; --fg: #E6ECF1; --mute: #8D9BA8;
+          --ok: #3CC48C; --bad: #F06B5F; --warn: #F0A548; --off: #4F5D6A; --accent: #6FA0F5; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--sans); }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 18px 16px 40px; display: grid; gap: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; justify-content: space-between; }
+h1 { font: 700 30px/1 var(--disp); margin: 0; letter-spacing: .5px; }
+h1 small { font: 500 13px var(--mono); color: var(--mute); letter-spacing: 0; margin-left: 8px; }
+h2 { font: 700 18px var(--disp); letter-spacing: 1.2px; text-transform: uppercase; color: var(--mute); margin: 0 0 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; min-width: 0; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.chip { display: inline-flex; align-items: center; gap: 8px; font: 500 13px var(--mono); padding: 6px 10px;
+        border-radius: 999px; border: 1px solid var(--line); background: var(--panel); white-space: nowrap; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--off); flex: none; }
+.ok .dot { background: var(--ok); } .bad .dot { background: var(--bad); } .warn .dot { background: var(--warn); }
+/* Cadena de capas */
+.cadena { display: flex; align-items: stretch; overflow-x: auto; padding-bottom: 4px; }
+.eslabon { flex: 1 0 120px; text-align: center; padding: 10px 6px; border: 2px solid var(--off); border-radius: 10px; background: var(--panel); }
+.eslabon b { display: block; font: 700 17px var(--disp); letter-spacing: .5px; }
+.eslabon span { font: 12px var(--mono); color: var(--mute); }
+.enlace { flex: 1 0 70px; display: flex; flex-direction: column; justify-content: center; align-items: center; min-width: 70px; }
+.enlace i { display: block; height: 4px; width: 100%; background: var(--off); border-radius: 2px; }
+.enlace em { font: 600 11px var(--mono); font-style: normal; color: var(--mute); margin: 4px 0; text-align: center; }
+.enlace.ok i { background: var(--ok); } .enlace.bad i { background: repeating-linear-gradient(90deg, var(--bad) 0 8px, transparent 8px 14px); }
+.enlace.ok em { color: var(--ok); } .enlace.bad em { color: var(--bad); }
+.eslabon.ok { border-color: var(--ok); } .eslabon.bad { border-color: var(--bad); }
+.falla { margin-top: 10px; font: 600 15px var(--sans); }
+.falla.ok { color: var(--ok); } .falla.bad { color: var(--bad); }
+/* Datos */
+.fila { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); }
+.fila:first-of-type { border-top: 0; }
+.nombre { font: 13px var(--mono); color: var(--mute); }
+.valor { font: 600 22px var(--mono); font-variant-numeric: tabular-nums; }
+.barra { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; margin-top: 6px; }
+.barra > div { height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+.lamp { width: 26px; height: 26px; border-radius: 50%; background: var(--off); border: 2px solid var(--line); }
+.lamp.on { background: var(--warn); box-shadow: 0 0 14px var(--warn); }
+.estado-grande { font: 700 28px var(--disp); letter-spacing: .5px; }
+.estado-grande.ok { color: var(--ok); } .estado-grande.bad { color: var(--bad); } .estado-grande.warn { color: var(--warn); }
+.cont { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+.cont div { border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+.cont span { display: block; font: 11px var(--mono); color: var(--mute); }
+.cont b { font: 600 18px var(--mono); font-variant-numeric: tabular-nums; }
+button { font: 600 14px var(--sans); padding: 10px 16px; border-radius: 8px; border: 1px solid var(--accent);
+         background: var(--accent); color: #fff; cursor: pointer; }
+button.sec { background: transparent; color: var(--accent); }
+button:disabled, input:disabled { opacity: .45; cursor: not-allowed; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.stale { opacity: .45; }
+/* Conexión */
+form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); align-items: end; }
+label { display: grid; gap: 4px; font: 12px var(--mono); color: var(--mute); }
+input[type=text], input[type=password] { font: 14px var(--mono); padding: 9px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg); width: 100%; }
+/* Registro */
+.log { font: 12px/1.5 var(--mono); max-height: 320px; overflow: auto; background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+.log div { white-space: nowrap; }
+.log .t { color: var(--mute); }
+.log .BIRTH { color: var(--ok); } .log .DEATH { color: var(--bad); } .log .CMD { color: var(--accent); } .log .AVISO { color: var(--warn); }
+.mini { font: 12px var(--mono); color: var(--mute); }
+.valor { white-space: nowrap; }
+details > summary { cursor: pointer; list-style: none; }
+details > summary h2 { display: inline; }
+details[open] > summary { margin-bottom: 12px; }
+/* En el celular la cadena de capas va vertical */
+@media (max-width: 720px) {
+  .cadena { flex-direction: column; overflow: visible; }
+  .eslabon { flex: none; }
+  .enlace { flex: none; flex-direction: row; gap: 10px; min-height: 44px; justify-content: center; }
+  .enlace i { width: 4px; height: 44px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Panel PdCI T3 <small>Host Application · Sparkplug B</small></h1>
+    <span class="chip" id="chipMqtt"><span class="dot"></span><span id="txtMqtt">Desconectado</span></span>
+  </header>
+
+  <details class="card" id="cardCon" open>
+    <summary><h2>Conexión al broker</h2> <span class="mini">(tocá para mostrar u ocultar)</span></summary>
+    <form id="form">
+      <label>URL (WSS)<input type="text" id="fUrl" value="wss://sb18d1ea.ala.eu-central-1.emqxsl.com:8084/mqtt"></label>
+      <label>Grupo<input type="text" id="fGrupo" value="UNRaf_PdCI"></label>
+      <label>Usuario<input type="text" id="fUser" value="web_host" autocomplete="username"></label>
+      <label>Contraseña<input type="password" id="fPass" autocomplete="current-password"></label>
+      <div style="display:flex;gap:8px"><button type="submit" id="btnCon">Conectar</button>
+        <button type="button" class="sec" id="btnRebirth" disabled>Pedir Rebirth</button></div>
+    </form>
+    <p class="mini">La contraseña se guarda solo en este navegador. Host ID: <span id="hostId">Web_PdCI</span></p>
+  </details>
+  <section class="card">
+    <h2>Estado de la comunicación</h2>
+    <div class="cadena">
+      <div class="eslabon" id="nWeb"><b>Web</b><span>Host App</span></div>
+      <div class="enlace" id="lBroker"><em>MQTT/WSS</em><i></i><em id="eBroker">—</em></div>
+      <div class="eslabon" id="nBroker"><b>Broker</b><span>EMQX</span></div>
+      <div class="enlace" id="lEdge"><em>MQTT/TLS</em><i></i><em id="eEdge">—</em></div>
+      <div class="eslabon" id="nEdge"><b>RPi 2</b><span>Edge Node</span></div>
+      <div class="enlace" id="lOpc"><em>OPC UA</em><i></i><em id="eOpc">—</em></div>
+      <div class="eslabon" id="nRpi1"><b>RPi 1</b><span>Servidor</span></div>
+      <div class="enlace" id="lMb"><em>MODBUS</em><i></i><em id="eMb">—</em></div>
+      <div class="eslabon" id="nEsc"><b>Esclavo1</b><span>Arduino</span></div>
+    </div>
+    <div class="falla" id="falla">Conectate al broker para ver el estado.</div>
+  </section>
+
+  <div class="grid">
+    <section class="card" id="cardEntradas">
+      <h2>Entradas · Esclavo1</h2>
+      <div class="fila"><div><div class="nombre">Inputs/Pulsador</div><div class="valor" id="vPul">—</div></div><div class="lamp" id="lampPul"></div></div>
+      <div class="fila" style="display:block">
+        <div class="nombre">Inputs/Potenciometro</div>
+        <div class="valor"><span id="vPot">—</span> <span class="mini" id="vPotV"></span></div>
+        <div class="barra"><div id="bPot"></div></div>
+      </div>
+    </section>
+
+    <section class="card" id="cardSalidas">
+      <h2>Salidas · Esclavo1</h2>
+      <div class="fila">
+        <div><div class="nombre">Outputs/LED</div><div class="valor" id="vLed">—</div></div>
+        <div style="display:flex;gap:12px;align-items:center"><div class="lamp" id="lampLed"></div><button id="btnLed" disabled>Encender</button></div>
+      </div>
+      <div class="fila" style="display:block">
+        <div class="nombre">Outputs/PWM <span id="vPwmCmd" class="mini"></span></div>
+        <div class="valor" id="vPwm">—</div>
+        <input type="range" id="sPwm" min="0" max="255" value="0" disabled aria-label="Consigna PWM">
+        <div class="mini">Soltá el control para enviar el DCMD</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>MODBUS · RPi 1 ↔ Esclavo1</h2>
+      <div class="estado-grande" id="vMbEstado">—</div>
+      <div class="cont">
+        <div><span>OK</span><b id="cOK">—</b></div>
+        <div><span>CRC_ERROR</span><b id="cCRC">—</b></div>
+        <div><span>TIMEOUT</span><b id="cTO">—</b></div>
+        <div><span>FRAME_ERROR</span><b id="cFR">—</b></div>
+        <div><span>EXCEPCION</span><b id="cEX">—</b></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>OPC UA · MQTT · Sparkplug B</h2>
+      <div class="fila"><span class="nombre">Status/OPCUA/Estado</span><span class="valor" id="vOpc">—</span></div>
+      <div class="fila"><span class="nombre">Status/MQTT/Reconexiones</span><span class="valor" id="vRec">—</span></div>
+      <div class="fila"><span class="nombre">Status/Sparkplug/Rebirths</span><span class="valor" id="vReb">—</span></div>
+      <div class="fila"><span class="nombre">bdSeq · último seq</span><span class="valor" id="vSeq">—</span></div>
+      <div class="fila"><span class="nombre">Saltos de seq detectados · Rebirth pedidos</span><span class="valor" id="vSaltos">0 · 0</span></div>
+      <div class="fila"><span class="nombre">Reconexiones de esta página</span><span class="valor" id="vRecWeb">0</span></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Mensajes Sparkplug B</h2>
+    <div class="log" id="log"></div>
+  </section>
+
+</div>
+
+<script id="proto" type="text/plain">// * Copyright (c) 2015, 2018 Cirrus Link Solutions and others
+// *
+// * This program and the accompanying materials are made available under the
+// * terms of the Eclipse Public License 2.0 which is available at
+// * http://www.eclipse.org/legal/epl-2.0.
+// *
+// * SPDX-License-Identifier: EPL-2.0
+// *
+// * Contributors:
+// *   Cirrus Link Solutions - initial implementation
+
+//
+// To compile:
+// cd client_libraries/java
+// protoc --proto_path=../../ --java_out=src/main/java ../../sparkplug_b.proto
+//
+
+syntax = "proto2";
+
+package org.eclipse.tahu.protobuf;
+
+option java_package         = "org.eclipse.tahu.protobuf";
+option java_outer_classname = "SparkplugBProto";
+
+enum DataType {
+    // Indexes of Data Types
+
+    // Unknown placeholder for future expansion.
+    Unknown         = 0;
+
+    // Basic Types
+    Int8            = 1;
+    Int16           = 2;
+    Int32           = 3;
+    Int64           = 4;
+    UInt8           = 5;
+    UInt16          = 6;
+    UInt32          = 7;
+    UInt64          = 8;
+    Float           = 9;
+    Double          = 10;
+    Boolean         = 11;
+    String          = 12;
+    DateTime        = 13;
+    Text            = 14;
+
+    // Additional Metric Types
+    UUID            = 15;
+    DataSet         = 16;
+    Bytes           = 17;
+    File            = 18;
+    Template        = 19;
+
+    // Additional PropertyValue Types
+    PropertySet     = 20;
+    PropertySetList = 21;
+
+    // Array Types
+    Int8Array = 22;
+    Int16Array = 23;
+    Int32Array = 24;
+    Int64Array = 25;
+    UInt8Array = 26;
+    UInt16Array = 27;
+    UInt32Array = 28;
+    UInt64Array = 29;
+    FloatArray = 30;
+    DoubleArray = 31;
+    BooleanArray = 32;
+    StringArray = 33;
+    DateTimeArray = 34;
+}
+
+message Payload {
+
+    message Template {
+
+        message Parameter {
+            optional string name        = 1;
+            optional uint32 type        = 2;
+
+            oneof value {
+                uint32 int_value        = 3;
+                uint64 long_value       = 4;
+                float  float_value      = 5;
+                double double_value     = 6;
+                bool   boolean_value    = 7;
+                string string_value     = 8;
+                ParameterValueExtension extension_value = 9;
+            }
+
+            message ParameterValueExtension {
+                extensions              1 to max;
+            }
+        }
+
+        optional string version         = 1;          // The version of the Template to prevent mismatches
+        repeated Metric metrics         = 2;          // Each metric includes a name, datatype, and optionally a value
+        repeated Parameter parameters   = 3;
+        optional string template_ref    = 4;          // MUST be a reference to a template definition if this is an instance (i.e. the name of the template definition) - MUST be omitted for template definitions
+        optional bool is_definition     = 5;
+        extensions                      6 to max;
+    }
+
+    message DataSet {
+
+        message DataSetValue {
+
+            oneof value {
+                uint32 int_value                        = 1;
+                uint64 long_value                       = 2;
+                float  float_value                      = 3;
+                double double_value                     = 4;
+                bool   boolean_value                    = 5;
+                string string_value                     = 6;
+                DataSetValueExtension extension_value   = 7;
+            }
+
+            message DataSetValueExtension {
+                extensions  1 to max;
+            }
+        }
+
+        message Row {
+            repeated DataSetValue elements  = 1;
+            extensions                      2 to max;   // For third party extensions
+        }
+
+        optional uint64   num_of_columns    = 1;
+        repeated string   columns           = 2;
+        repeated uint32   types             = 3;
+        repeated Row      rows              = 4;
+        extensions                          5 to max;   // For third party extensions
+    }
+
+    message PropertyValue {
+
+        optional uint32     type                    = 1;
+        optional bool       is_null                 = 2;
+
+        oneof value {
+            uint32          int_value               = 3;
+            uint64          long_value              = 4;
+            float           float_value             = 5;
+            double          double_value            = 6;
+            bool            boolean_value           = 7;
+            string          string_value            = 8;
+            PropertySet     propertyset_value       = 9;
+            PropertySetList propertysets_value      = 10;      // List of Property Values
+            PropertyValueExtension extension_value  = 11;
+        }
+
+        message PropertyValueExtension {
+            extensions                             1 to max;
+        }
+    }
+
+    message PropertySet {
+        repeated string        keys     = 1;         // Names of the properties
+        repeated PropertyValue values   = 2;
+        extensions                      3 to max;
+    }
+
+    message PropertySetList {
+        repeated PropertySet propertyset = 1;
+        extensions                       2 to max;
+    }
+
+    message MetaData {
+        // Bytes specific metadata
+        optional bool   is_multi_part   = 1;
+
+        // General metadata
+        optional string content_type    = 2;        // Content/Media type
+        optional uint64 size            = 3;        // File size, String size, Multi-part size, etc
+        optional uint64 seq             = 4;        // Sequence number for multi-part messages
+
+        // File metadata
+        optional string file_name       = 5;        // File name
+        optional string file_type       = 6;        // File type (i.e. xml, json, txt, cpp, etc)
+        optional string md5             = 7;        // md5 of data
+
+        // Catchalls and future expansion
+        optional string description     = 8;        // Could be anything such as json or xml of custom properties
+        extensions                      9 to max;
+    }
+
+    message Metric {
+
+        optional string   name          = 1;        // Metric name - should only be included on birth
+        optional uint64   alias         = 2;        // Metric alias - tied to name on birth and included in all later DATA messages
+        optional uint64   timestamp     = 3;        // Timestamp associated with data acquisition time
+        optional uint32   datatype      = 4;        // DataType of the metric/tag value
+        optional bool     is_historical = 5;        // If this is historical data and should not update real time tag
+        optional bool     is_transient  = 6;        // Tells consuming clients such as MQTT Engine to not store this as a tag
+        optional bool     is_null       = 7;        // If this is null - explicitly say so rather than using -1, false, etc for some datatypes.
+        optional MetaData metadata      = 8;        // Metadata for the payload
+        optional PropertySet properties = 9;
+
+        oneof value {
+            uint32   int_value                      = 10;
+            uint64   long_value                     = 11;
+            float    float_value                    = 12;
+            double   double_value                   = 13;
+            bool     boolean_value                  = 14;
+            string   string_value                   = 15;
+            bytes    bytes_value                    = 16;       // Bytes, File
+            DataSet  dataset_value                  = 17;
+            Template template_value                 = 18;
+            MetricValueExtension extension_value    = 19;
+        }
+
+        message MetricValueExtension {
+            extensions  1 to max;
+        }
+    }
+
+    optional uint64   timestamp     = 1;        // Timestamp at message sending time
+    repeated Metric   metrics       = 2;        // Repeated forever - no limit in Google Protobufs
+    optional uint64   seq           = 3;        // Sequence number
+    optional string   uuid          = 4;        // UUID to track message type in terms of schema definitions
+    optional bytes    body          = 5;        // To optionally bypass the whole definition above
+    extensions                      6 to max;   // For third party extensions
+}
+</script>
+<script>
+"use strict";
+// ---------------------------------------------------------------- Configuración
+const HOST_ID = "Web_PdCI";
+const EDGE = "Edge_RPi2", DISPOSITIVO = "Esclavo1";
+const T_REBIRTH_MIN = 5000;          // ms mínimos entre dos pedidos de Rebirth
+const DT = { Int64: 4, UInt16: 6, UInt32: 7, Boolean: 11, String: 12 };
+
+// Protobuf: la definición oficial sparkplug_b.proto va embebida en la página
+const raiz = protobuf.parse(document.getElementById("proto").textContent, { keepCase: true }).root;
+const Payload = raiz.lookupType("org.eclipse.tahu.protobuf.Payload");
+
+// ---------------------------------------------------------------- Estado de la Host Application
+let cliente = null, grupo = "UNRaf_PdCI";
+const nodo = { enLinea: false, birth: false, bdSeq: null, seq: null };
+const disp = { enLinea: false, birth: false };
+const metricas = {};                 // nombre -> valor
+let saltos = 0, rebirthsPedidos = 0, ultimoRebirth = 0, reconexionesWeb = 0;
+
+const $ = id => document.getElementById(id);
+const guardar = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const leer = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+
+function registrar(tipo, texto) {
+  const d = document.createElement("div");
+  const clase = /BIRTH/.test(tipo) ? "BIRTH" : /DEATH/.test(tipo) ? "DEATH" : /CMD/.test(tipo) ? "CMD" : tipo === "AVISO" ? "AVISO" : "";
+  d.innerHTML = `<span class="t">${new Date().toLocaleTimeString()}</span> <b class="${clase}">${tipo.padEnd(6, " ")}</b> `;
+  d.appendChild(document.createTextNode(texto));
+  const log = $("log");
+  log.prepend(d);
+  while (log.childElementCount > 80) log.lastChild.remove();
+}
+
+// ---------------------------------------------------------------- Payload
+function valorDe(m) {
+  for (const k of ["boolean_value", "int_value", "long_value", "float_value", "double_value", "string_value"])
+    if (m[k] !== undefined && m[k] !== null) return m[k];
+  return null;
+}
+
+function decodificar(bytes) {
+  const p = Payload.toObject(Payload.decode(bytes), { longs: Number, defaults: false });
+  p.metrics = p.metrics || [];
+  return p;
+}
+
+function codificar(nombre, tipo, valor) {
+  const m = { name: nombre, timestamp: Date.now(), datatype: DT[tipo] };
+  m[tipo === "Boolean" ? "boolean_value" : "int_value"] = valor;
+  return Payload.encode(Payload.create({ timestamp: Date.now(), metrics: [m] })).finish();
+}
+
+// ---------------------------------------------------------------- Ciclo de vida Sparkplug
+function pedirRebirth(motivo) {
+  if (!cliente || !cliente.connected || Date.now() - ultimoRebirth < T_REBIRTH_MIN) return;
+  ultimoRebirth = Date.now();
+  rebirthsPedidos++;
+  cliente.publish(`spBv1.0/${grupo}/NCMD/${EDGE}`, codificar("Node Control/Rebirth", "Boolean", true));
+  registrar("NCMD", `Rebirth pedido: ${motivo}`);
+}
+
+function controlarSeq(seq) {
+  if (nodo.seq === null) { nodo.seq = seq; return; }
+  const esperado = (nodo.seq + 1) % 256;
+  if (seq !== esperado) {
+    saltos++;
+    registrar("AVISO", `Salto de seq: esperado ${esperado}, llegó ${seq} (mensajes perdidos)`);
+    pedirRebirth("salto de seq");
+  }
+  nodo.seq = seq;
+}
+
+function aplicar(lista) {
+  for (const m of lista) metricas[m.name] = valorDe(m);
+}
+
+function recibir(topico, bytes) {
+  const partes = topico.split("/");            // spBv1.0 / grupo / tipo / nodo [/ dispositivo]
+  const tipo = partes[2];
+  if (partes[3] !== EDGE) return;
+  let p;
+  try { p = decodificar(bytes); } catch (e) { registrar("AVISO", `Payload no válido en ${topico}`); return; }
+  const resumen = p.metrics.map(m => `${m.name}=${valorDe(m)}`).join(", ");
+  const seqTxt = p.seq !== undefined ? ` seq=${p.seq}` : "";
+
+  switch (tipo) {
+    case "NBIRTH": {
+      nodo.enLinea = nodo.birth = true;
+      nodo.seq = p.seq ?? 0;
+      const bd = p.metrics.find(m => m.name === "bdSeq");
+      nodo.bdSeq = bd ? valorDe(bd) : null;
+      aplicar(p.metrics);
+      break;
+    }
+    case "NDEATH": {
+      const bd = p.metrics.find(m => m.name === "bdSeq");
+      const n = bd ? valorDe(bd) : null;
+      if (nodo.bdSeq !== null && n !== nodo.bdSeq) {   // Will de una sesión anterior: se ignora
+        registrar("AVISO", `NDEATH con bdSeq=${n} ignorado (sesión actual bdSeq=${nodo.bdSeq})`);
+        return;
+      }
+      nodo.enLinea = nodo.birth = false; disp.enLinea = disp.birth = false; nodo.seq = null;
+      break;
+    }
+    case "DBIRTH":
+      if (!nodo.birth) { pedirRebirth("DBIRTH sin NBIRTH"); return; }
+      controlarSeq(p.seq); disp.enLinea = disp.birth = true; aplicar(p.metrics);
+      break;
+    case "DDEATH":
+      if (!nodo.birth) { pedirRebirth("DDEATH sin NBIRTH"); return; }
+      controlarSeq(p.seq); disp.enLinea = disp.birth = false;
+      break;
+    case "NDATA":
+      if (!nodo.birth) { registrar(tipo, `(sin NBIRTH previo)${seqTxt} ${resumen}`); pedirRebirth("NDATA sin NBIRTH"); return; }
+      controlarSeq(p.seq); aplicar(p.metrics);
+      break;
+    case "DDATA":
+      if (!nodo.birth || !disp.birth) { registrar(tipo, `(sin BIRTH previo)${seqTxt} ${resumen}`); pedirRebirth("DDATA sin DBIRTH"); return; }
+      controlarSeq(p.seq); aplicar(p.metrics);
+      break;
+    case "NCMD": case "DCMD":
+      break;                                      // comandos (propios o de otra herramienta): solo se registran
+    default:
+      return;
+  }
+  registrar(tipo, `${seqTxt.trim()} ${resumen}`.trim());
+  pintar();
+}
+
+// ---------------------------------------------------------------- Interfaz
+function marcar(id, estado, texto) {
+  const el = $(id);
+  el.classList.remove("ok", "bad");
+  if (estado) el.classList.add(estado);
+  if (texto !== undefined) {
+    const em = el.querySelector("em:last-child");
+    if (em) em.textContent = texto;
+  }
+}
+
+function pintar() {
+  const conectado = !!(cliente && cliente.connected);
+  const mb = metricas["Status/MODBUS/Estado"], opc = metricas["Status/OPCUA/Estado"];
+
+  // Cadena de capas: cada enlace en verde (funciona), rojo (falla) o gris (desconocido)
+  marcar("nWeb", "ok");
+  marcar("lBroker", conectado ? "ok" : cliente ? "bad" : null, conectado ? "conectado" : cliente ? "sin conexión" : "—");
+  marcar("nBroker", conectado ? "ok" : null);
+  const edge = conectado ? (nodo.enLinea ? "ok" : "bad") : null;
+  marcar("lEdge", edge, !conectado ? "—" : nodo.enLinea ? "NBIRTH" : "NDEATH / sin BIRTH");
+  marcar("nEdge", edge);
+  const opcOk = nodo.enLinea ? (opc === "DONE" ? "ok" : "bad") : null;
+  marcar("lOpc", opcOk, nodo.enLinea ? (opc ?? "—") : "—");
+  marcar("nRpi1", opcOk);
+  const mbOk = nodo.enLinea && opc === "DONE" ? (mb === "DONE" && disp.enLinea ? "ok" : "bad") : null;
+  marcar("lMb", mbOk, mbOk ? (mb ?? "—") : "—");
+  marcar("nEsc", mbOk === "ok" && disp.enLinea ? "ok" : mbOk ? "bad" : null);
+
+  let falla = "Todo funcionando: datos en tiempo real desde el esclavo.", cls = "ok";
+  if (!cliente) { falla = "Ingresá la contraseña y tocá Conectar."; cls = ""; }
+  else if (!conectado) { falla = "Falla entre la página y el broker: sin conexión a internet o credenciales incorrectas."; cls = "bad"; }
+  else if (!nodo.enLinea) { falla = "Falla en el Edge Node (RPi 2) o en su conexión a internet: NDEATH recibido o sin NBIRTH."; cls = "bad"; }
+  else if (opc !== "DONE") { falla = "Falla OPC UA entre la RPi 2 y la RPi 1 (cable Ethernet o servidor detenido)."; cls = "bad"; }
+  else if (mb === "CRC ERROR") { falla = "MODBUS: CRC ERROR. Llegan tramas dañadas desde el esclavo."; cls = "bad"; }
+  else if (mb !== "DONE" || !disp.enLinea) { falla = "Falla MODBUS entre la RPi 1 y el esclavo: DEVICE NOT REACHED (DDEATH)."; cls = "bad"; }
+  $("falla").textContent = falla; $("falla").className = "falla " + cls;
+
+  // Entradas y salidas
+  const vivo = nodo.enLinea && disp.enLinea;
+  for (const id of ["cardEntradas", "cardSalidas"]) $(id).classList.toggle("stale", !vivo);
+  const pul = metricas["Inputs/Pulsador"], pot = metricas["Inputs/Potenciometro"];
+  const led = metricas["Outputs/LED"], pwm = metricas["Outputs/PWM"];
+  $("vPul").textContent = pul == null ? "—" : pul ? "PRESIONADO" : "liberado";
+  $("lampPul").classList.toggle("on", !!pul);
+  $("vPot").textContent = pot ?? "—";
+  $("vPotV").textContent = pot == null ? "" : `/ 1023 · ${(pot * 5 / 1023).toFixed(2)} V`;
+  $("bPot").style.width = pot == null ? "0" : `${(pot / 1023) * 100}%`;
+  $("vLed").textContent = led == null ? "—" : led ? "ENCENDIDO" : "apagado";
+  $("lampLed").classList.toggle("on", !!led);
+  $("btnLed").textContent = led ? "Apagar" : "Encender";
+  $("vPwm").textContent = pwm == null ? "—" : `${pwm} / 255`;
+  if (pwm != null && document.activeElement !== $("sPwm")) $("sPwm").value = pwm;
+  $("btnLed").disabled = $("sPwm").disabled = !(conectado && vivo);
+  $("btnRebirth").disabled = !conectado;
+
+  // Estados y contadores
+  const e = $("vMbEstado");
+  e.textContent = mb ?? "—";
+  e.className = "estado-grande " + (mb === "DONE" ? "ok" : mb === "CRC ERROR" ? "warn" : mb ? "bad" : "");
+  const c = n => metricas["Status/MODBUS/" + n] ?? "—";
+  $("cOK").textContent = c("OK"); $("cCRC").textContent = c("CRC_ERROR"); $("cTO").textContent = c("TIMEOUT");
+  $("cFR").textContent = c("FRAME_ERROR"); $("cEX").textContent = c("EXCEPCION");
+  $("vOpc").textContent = opc ?? "—";
+  $("vRec").textContent = metricas["Status/MQTT/Reconexiones"] ?? "—";
+  $("vReb").textContent = metricas["Status/Sparkplug/Rebirths"] ?? "—";
+  $("vSeq").textContent = `${nodo.bdSeq ?? "—"} · ${nodo.seq ?? "—"}`;
+  $("vSaltos").textContent = `${saltos} · ${rebirthsPedidos}`;
+  $("vRecWeb").textContent = reconexionesWeb;
+  $("chipMqtt").className = "chip " + (conectado ? "ok" : cliente ? "bad" : "");
+  $("txtMqtt").textContent = conectado ? "Conectado al broker" : cliente ? "Reconectando…" : "Desconectado";
+}
+
+// ---------------------------------------------------------------- Conexión MQTT
+function estado(online) {
+  return JSON.stringify({ online, timestamp: Date.now() });
+}
+
+function conectar() {
+  if (cliente) { cliente.end(true); cliente = null; }
+  grupo = $("fGrupo").value.trim();
+  const url = $("fUrl").value.trim(), user = $("fUser").value.trim(), pass = $("fPass").value;
+  guardar("pdci_url", url); guardar("pdci_user", user); guardar("pdci_pass", pass); guardar("pdci_grupo", grupo);
+  const topicoEstado = `spBv1.0/STATE/${HOST_ID}`;
+  cliente = mqtt.connect(url, {
+    username: user, password: pass,
+    clientId: `${HOST_ID}-${Math.random().toString(16).slice(2, 8)}`,
+    protocolVersion: 4, clean: true, keepalive: 10, reconnectPeriod: 2000, connectTimeout: 8000,
+    // Last Will: si la página se cae sin avisar, el broker publica el estado offline (retenido)
+    will: { topic: topicoEstado, payload: estado(false), qos: 1, retain: true },
+  });
+  let primera = true;
+  cliente.on("connect", () => {
+    if (!primera) reconexionesWeb++;
+    primera = false;
+    cliente.publish(topicoEstado, estado(true), { qos: 1, retain: true });
+    cliente.subscribe(`spBv1.0/${grupo}/#`, { qos: 0 });
+    registrar("AVISO", `Conectado a ${url}. STATE online publicado.`);
+    $("cardCon").open = false;
+    nodo.birth = disp.birth = false; nodo.seq = null;
+    setTimeout(() => { if (!nodo.birth) pedirRebirth("sin NBIRTH al conectar"); }, 1500);
+    pintar();
+  });
+  cliente.on("message", (t, m) => recibir(t, m));
+  cliente.on("close", pintar);
+  cliente.on("offline", () => { registrar("AVISO", "Sin conexión con el broker. Reintentando…"); pintar(); });
+  cliente.on("error", e => { registrar("AVISO", `Error MQTT: ${e.message}`); pintar(); });
+}
+
+// ---------------------------------------------------------------- Controles
+$("form").addEventListener("submit", ev => { ev.preventDefault(); conectar(); });
+$("btnRebirth").addEventListener("click", () => { ultimoRebirth = 0; pedirRebirth("pedido manual"); pintar(); });
+$("btnLed").addEventListener("click", () => {
+  const nuevo = !metricas["Outputs/LED"];
+  cliente.publish(`spBv1.0/${grupo}/DCMD/${EDGE}/${DISPOSITIVO}`, codificar("Outputs/LED", "Boolean", nuevo));
+  registrar("DCMD", `Outputs/LED=${nuevo} enviado`);
+});
+$("sPwm").addEventListener("input", () => { $("vPwmCmd").textContent = `→ ${$("sPwm").value}`; });
+$("sPwm").addEventListener("change", () => {
+  const v = Number($("sPwm").value);
+  cliente.publish(`spBv1.0/${grupo}/DCMD/${EDGE}/${DISPOSITIVO}`, codificar("Outputs/PWM", "UInt16", v));
+  registrar("DCMD", `Outputs/PWM=${v} enviado`);
+  $("vPwmCmd").textContent = "";
+  $("sPwm").blur();
+});
+window.addEventListener("pagehide", () => {     // cierre ordenado: STATE offline antes de salir
+  if (cliente && cliente.connected) cliente.publish(`spBv1.0/STATE/${HOST_ID}`, estado(false), { qos: 1, retain: true });
+});
+
+// Datos guardados en este navegador
+for (const [id, k] of [["fUrl", "pdci_url"], ["fUser", "pdci_user"], ["fPass", "pdci_pass"], ["fGrupo", "pdci_grupo"]]) {
+  const v = leer(k); if (v) $(id).value = v;
+}
+pintar();
+if ($("fPass").value) conectar();
+</script>
+</body>
+</html>
