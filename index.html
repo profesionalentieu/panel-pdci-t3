@@ -175,6 +175,7 @@ details[open] > summary { margin-bottom: 12px; }
     <section class="card">
       <h2>OPC UA · MQTT · Sparkplug B</h2>
       <div class="fila"><span class="nombre">Status/OPCUA/Estado</span><span class="valor" id="vOpc">—</span></div>
+      <div class="fila"><span class="nombre">Status/OPCUA/Reconexiones</span><span class="valor" id="vRecOpc">—</span></div>
       <div class="fila"><span class="nombre">Status/MQTT/Reconexiones</span><span class="valor" id="vRec">—</span></div>
       <div class="fila"><span class="nombre">Status/Sparkplug/Rebirths</span><span class="valor" id="vReb">—</span></div>
       <div class="fila"><span class="nombre">bdSeq · último seq</span><span class="valor" id="vSeq">—</span></div>
@@ -608,6 +609,7 @@ function pintar() {
   $("cOK").textContent = c("OK"); $("cCRC").textContent = c("CRC_ERROR"); $("cTO").textContent = c("TIMEOUT");
   $("cFR").textContent = c("FRAME_ERROR"); $("cEX").textContent = c("EXCEPCION");
   $("vOpc").textContent = opc ?? "—";
+  $("vRecOpc").textContent = metricas["Status/OPCUA/Reconexiones"] ?? "—";
   $("vRec").textContent = metricas["Status/MQTT/Reconexiones"] ?? "—";
   $("vReb").textContent = metricas["Status/Sparkplug/Rebirths"] ?? "—";
   $("vSeq").textContent = `${nodo.bdSeq ?? "—"} · ${nodo.seq ?? "—"}`;
